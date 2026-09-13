@@ -1,16 +1,35 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { songKey } from '../api/music';
 import { useSocket } from './useSocket';
 import type { FavoriteSong, Song } from '../types';
 import { fetchAccountSession } from '../lib/accountAuth';
+import { getClientId } from '../lib/clientId';
+import {
+  markFavoritesSyncAttempt,
+  markFavoritesSyncFailed,
+  markFavoritesSyncPending,
+  markFavoritesSyncResult,
+  readFavoritesSyncState,
+  syncAccountFavorites,
+  type FavoritesSyncState,
+} from '../lib/favoritesSync';
 
 let sharedFavoriteIds = new Set<string>();
 let sharedFavoriteSongs: FavoriteSong[] = [];
 let loadPromise: Promise<void> | null = null;
 const listeners = new Set<() => void>();
+let sharedSyncState = readFavoritesSyncState();
+const syncListeners = new Set<() => void>();
 
 const GUEST_CACHE_KEY = 'openmusic:favorites-cache:v1:guest';
 const ACCOUNT_CACHE_PREFIX = 'openmusic:favorites-cache:v1:account:';
+const GUEST_ID_KEY = 'openmusic:favorites-cache:v1:guest-identity';
+
+function rememberGuestIdentity(): string {
+  const id = getClientId();
+  try { localStorage.setItem(GUEST_ID_KEY, id); } catch { /* storage unavailable */ }
+  return id;
+}
 
 function readCache(key: string): FavoriteSong[] {
   try {
@@ -47,14 +66,27 @@ function updateSharedFavorites(songs: FavoriteSong[], cacheKey?: string) {
   notifyListeners();
 }
 
+function updateSharedSyncState(state: FavoritesSyncState) {
+  sharedSyncState = state;
+  syncListeners.forEach((listener) => listener());
+}
+
 export function useFavorites() {
   const { listFavorites, setFavorite, importFavorites } = useSocket();
   const [favoriteIds, setFavoriteIds] = useState<Set<string>>(() => new Set(sharedFavoriteIds));
+  const [syncState, setSyncState] = useState<FavoritesSyncState>(() => sharedSyncState);
+  const retryTimer = useRef<number | null>(null);
 
   useEffect(() => {
     const listener = () => setFavoriteIds(new Set(sharedFavoriteIds));
     listeners.add(listener);
     return () => { listeners.delete(listener); };
+  }, []);
+
+  useEffect(() => {
+    const listener = () => setSyncState(sharedSyncState);
+    syncListeners.add(listener);
+    return () => { syncListeners.delete(listener); };
   }, []);
 
   const ensureLoaded = useCallback(async () => {
@@ -67,6 +99,7 @@ export function useFavorites() {
       try { account = await fetchAccountSession(); } catch { /* use cache */ }
 
       if (!account) {
+        if (guestCached.length) rememberGuestIdentity();
         if (!guestCached.length) updateSharedFavorites([], GUEST_CACHE_KEY);
         return;
       }
@@ -75,15 +108,27 @@ export function useFavorites() {
       const accountCached = readCache(cacheKey);
       if (accountCached.length) updateSharedFavorites(accountCached, cacheKey);
 
+      if (guestCached.length) updateSharedSyncState(markFavoritesSyncPending());
       const result = await listFavorites();
-      if (!result.success) return;
+      if (!result.success) {
+        if (guestCached.length) updateSharedSyncState(markFavoritesSyncFailed(result.error || '收藏同步失败'));
+        return;
+      }
 
       let next = result.favorites || [];
       if (guestCached.length) {
-        const imported = await importFavorites(guestCached);
-        if (imported.success && imported.favorites) {
-          next = imported.favorites;
+        const attempt = markFavoritesSyncAttempt();
+        updateSharedSyncState(attempt);
+        try {
+          const imported = await syncAccountFavorites(guestCached);
+          if (!imported.success) throw new Error(imported.error || '收藏同步失败');
+          if (imported.favorites) next = imported.favorites;
           removeCache(GUEST_CACHE_KEY);
+          const syncResult = imported.identitySame ? 'identity_same' : 'merged';
+          updateSharedSyncState(markFavoritesSyncResult(syncResult, attempt));
+        } catch (error) {
+          updateSharedSyncState(markFavoritesSyncFailed(error, attempt));
+          throw error;
         }
       }
       updateSharedFavorites(next, cacheKey);
@@ -97,11 +142,36 @@ export function useFavorites() {
     const onAccountSessionChanged = () => {
       loadPromise = null;
       updateSharedFavorites(readCache(GUEST_CACHE_KEY), GUEST_CACHE_KEY);
+      if (readCache(GUEST_CACHE_KEY).length) updateSharedSyncState(markFavoritesSyncPending());
       void ensureLoaded();
     };
     window.addEventListener('openmusic:account-session-changed', onAccountSessionChanged);
     return () => window.removeEventListener('openmusic:account-session-changed', onAccountSessionChanged);
   }, [ensureLoaded]);
+
+  useEffect(() => {
+    const retryWhenOnline = () => {
+      if (!readCache(GUEST_CACHE_KEY).length) return;
+      loadPromise = null;
+      void ensureLoaded();
+    };
+    window.addEventListener('online', retryWhenOnline);
+    return () => window.removeEventListener('online', retryWhenOnline);
+  }, [ensureLoaded]);
+
+  useEffect(() => {
+    if (syncState.status !== 'failed' || retryTimer.current !== null) return undefined;
+    const delay = Math.min(60_000, 2_000 * (2 ** Math.min(syncState.retryCount, 5)));
+    retryTimer.current = window.setTimeout(() => {
+      retryTimer.current = null;
+      loadPromise = null;
+      void ensureLoaded();
+    }, delay);
+    return () => {
+      if (retryTimer.current !== null) window.clearTimeout(retryTimer.current);
+      retryTimer.current = null;
+    };
+  }, [ensureLoaded, syncState.retryCount, syncState.status]);
 
   const isFavorite = useCallback(
     (song: Song | null) => (song ? favoriteIds.has(songKey(song)) : false),
@@ -118,6 +188,7 @@ export function useFavorites() {
     }
 
     if (!account) {
+      rememberGuestIdentity();
       const next = sharedFavoriteSongs.filter((item) => songKey(item) !== key);
       if (!favoriteIds.has(key)) next.unshift({ ...song, favoritedAt: Date.now() });
       updateSharedFavorites(next, GUEST_CACHE_KEY);
@@ -142,6 +213,13 @@ export function useFavorites() {
     await ensureLoaded();
   }, [ensureLoaded]);
 
+  const retryFavoritesSync = useCallback(async () => {
+    updateSharedSyncState(markFavoritesSyncPending());
+    loadPromise = null;
+    await ensureLoaded();
+    return readFavoritesSyncState();
+  }, [ensureLoaded]);
+
   const listCachedFavorites = useCallback(async () => {
     await ensureLoaded();
     return { success: true, favorites: sharedFavoriteSongs, error: undefined as string | undefined };
@@ -160,6 +238,7 @@ export function useFavorites() {
       return { success: false as const, error: '账户状态暂时无法确认，请稍后重试' };
     }
     if (!account) {
+      rememberGuestIdentity();
       const seen = new Set(sharedFavoriteSongs.map((item) => songKey(item)));
       const before = sharedFavoriteSongs.length;
       const next = [...sharedFavoriteSongs];
@@ -187,5 +266,7 @@ export function useFavorites() {
     importFavorites: importCachedFavorites,
     applyFavorites,
     reloadFavorites,
+    syncState,
+    retryFavoritesSync,
   };
 }

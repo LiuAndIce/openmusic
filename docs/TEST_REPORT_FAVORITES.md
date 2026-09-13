@@ -41,6 +41,13 @@
 - 游客缓存与账户缓存按身份隔离，账户切换时不得串读。
 - 游客缓存导入到账户后，以服务端合并结果作为最终状态。
 
+## 提交 2 同步状态实现
+
+- 客户端状态持久化在 `openmusic:favorites-sync:v1:guest`，支持 `pending`、`syncing`、`identity_same`、`merged`、`failed`。
+- 登录事件、页面启动和 Socket 恢复后会自动尝试同步；失败使用指数退避重试，Hook 暴露 `retryFavoritesSync()` 供界面提供手动重试入口。
+- 服务端新增 `/api/account/favorites/sync`，只接受当前账户会话和登录前签名游客交接凭证；目标身份由服务端 Cookie 决定，不接受任意游客 userId。
+- 同步失败保留本地缓存和状态，Hook 提供联网自动重试、指数退避和 `retryFavoritesSync()` 手动入口。
+
 ## 上线前补充检查
 
 - 使用两个浏览器或设备登录同一账户，确认收藏集合一致。
